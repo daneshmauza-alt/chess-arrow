@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1b1b1f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Chess Arrows</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: #1b1b1f; color: #eee; font-family: system-ui, sans-serif; }
+  main {
+    min-height: 100dvh; padding: 10px; display: flex; flex-direction: column;
+    align-items: center; gap: 12px; padding-top: max(10px, env(safe-area-inset-top));
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+  #board {
+    position: relative; width: min(100vw - 20px, 70dvh, 560px); aspect-ratio: 1;
+    display: grid; grid-template-columns: repeat(8, 1fr); grid-template-rows: repeat(8, 1fr);
+    border-radius: 6px; overflow: hidden; touch-action: manipulation;
+  }
+  .sq { display: flex; align-items: center; justify-content: center; }
+  .light { background: #eeeed2; }
+  .dark { background: #769656; }
+  .piece { font-size: min(9vw, 48px); line-height: 1; }
+  .white { color: #fff; text-shadow: 0 0 2px #000, 0 0 2px #000; }
+  .black { color: #000; }
+  svg#arrows { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #eval, #status { margin: 0; font-size: 15px; text-align: center; min-height: 1.4em; }
+  form { width: min(100vw - 20px, 560px); display: flex; flex-direction: column; gap: 8px; }
+  label { font-size: 13px; opacity: 0.75; }
+  input {
+    min-height: 44px; padding: 10px 12px; border-radius: 8px; border: 1px solid #3a3a42;
+    background: #26262c; color: #eee; font: 14px ui-monospace, monospace;
+  }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    flex: 1 1 auto; min-height: 44px; padding: 10px 14px; border: 0; border-radius: 8px;
+    font-size: 15px; background: #3a3a42; color: #eee; cursor: pointer;
+  }
+  button.primary { background: #15803d; }
+  button:disabled { opacity: 0.5; }
+</style>
+</head>
+<body>
+<main>
+  <div id="board" aria-label="Papan catur"></div>
+  <p id="eval" aria-live="polite"></p>
+  <form id="form" autocomplete="off">
+    <label for="fen">FEN posisi</label>
+    <input id="fen" type="text" autocapitalize="off" spellcheck="false" inputmode="text">
+    <div class="row">
+      <button id="analyse" class="primary" type="submit" disabled>Analisa</button>
+      <button id="flip" type="button">Balik papan</button>
+      <button id="start" type="button">Posisi awal</button>
+    </div>
+    <p id="status" role="status"></p>
+  </form>
+</main>
+
+<script>
+  const GLYPH = { K: '♔', Q: '♕', R: '♖', B: '♗', N: '♘', P: '♙', k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟' };
+  const START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+  const DEPTH = 12;
+  const LINES = 3;
+  const WATCHDOG_MS = 30000;
+  const COLORS = { best: '#15803d', alt: '#1d4ed8' };
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  const boardEl = document.getElementById('board');
+  const fenEl = document.getElementById('fen');
+  const analyseBtn = document.getElementById('analyse');
+  const statusEl = document.getElementById('status');
+  const evalEl = document.getElementById('eval');
+
+  let flip = false;
+  let board = [];          // 64 entries, index 0 = a8, index 63 = h1. '' = empty.
+  let engineReady = false;
+  let busy = false;
+  let arrows = [];         // [{ move, cp, mate }] from the last analysis, best first
+  let pending = null;      // lines collected for the running analysis
+  let analysedFen = '';    // normalised FEN the running analysis was started for
+  let watchdog = 0;
+
+  // Stockfish runs in a Worker next to the page. Same engine file as the extension.
+  let engine = null;
+  function startEngine() {
+    engineReady = false;
+    analyseBtn.disabled = true;
+    engine = new Worker('engine/stockfish-nnue-16-single.js');
+    engine.onmessage = (e) => onLine(String(e.data));
+    engine.onerror = (e) => setStatus('Mesin gagal jalan: ' + (e.message || 'error tidak diketahui'));
+    engine.postMessage('uci');
+  }
+  startEngine();
+
+  function setStatus(text) { statusEl.textContent = text; }
+
+  // Returns { board, side, fen } or throws with a readable message.
+  function parseFen(input) {
+    const parts = input.trim().split(/\s+/);
+    if (parts.length < 2) throw new Error('FEN minimal punya papan dan giliran (w atau b).');
+    const rows = parts[0].split('/');
+    if (rows.length !== 8) throw new Error('Papan di FEN harus 8 baris dipisah /.');
+
+    const cells = [];
+    for (const row of rows) {
+      let count = 0;
+      for (const ch of row) {
+        if (/[1-8]/.test(ch)) {
+          for (let k = 0; k < Number(ch); k++) cells.push('');
+          count += Number(ch);
+        } else if (/[prnbqkPRNBQK]/.test(ch)) {
+          cells.push(ch);
+          count++;
+        } else {
+          throw new Error('Karakter tidak dikenal di FEN: ' + ch);
+        }
+      }
+      if (count !== 8) throw new Error('Ada baris FEN yang tidak pas 8 kotak.');
+    }
+
+    const side = parts[1];
+    if (side !== 'w' && side !== 'b') throw new Error('Giliran harus w (putih) atau b (hitam).');
+    if (cells.filter((p) => p === 'K').length !== 1) throw new Error('Harus ada tepat satu raja putih (K).');
+    if (cells.filter((p) => p === 'k').length !== 1) throw new Error('Harus ada tepat satu raja hitam (k).');
+
+    // Stockfish is happier with all six fields. Fill the missing ones with safe defaults.
+    const fen = [
+      rows.join('/'), side, parts[2] || '-', parts[3] || '-', parts[4] || '0', parts[5] || '1',
+    ].join(' ');
+    return { board: cells, side, fen };
+  }
+
+  // Display index d -> board index. Flipping is a 180 degree turn.
+  function boardIndex(d) { return flip ? 63 - d : d; }
+  function displayPos(idx) { return flip ? 63 - idx : idx; }
+  function squareIndex(name) {
+    const col = name.charCodeAt(0) - 97;
+    const row = 8 - Number(name[1]);
+    return row * 8 + col;
+  }
+
+  function render() {
+    boardEl.innerHTML = '';
+    for (let d = 0; d < 64; d++) {
+      const r = Math.floor(d / 8), c = d % 8;
+      const sq = document.createElement('div');
+      sq.className = 'sq ' + ((r + c) % 2 === 0 ? 'light' : 'dark');
+      const code = board[boardIndex(d)];
+      if (code) {
+        const span = document.createElement('span');
+        span.className = 'piece ' + (code === code.toUpperCase() ? 'white' : 'black');
+        span.textContent = GLYPH[code];
+        sq.appendChild(span);
+      }
+      boardEl.appendChild(sq);
+    }
+    drawArrows();
+  }
+
+  function drawArrows() {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.id = 'arrows';
+    svg.setAttribute('viewBox', '0 0 8 8');
+    svg.setAttribute('preserveAspectRatio', 'none');
+
+    const defs = document.createElementNS(SVG_NS, 'defs');
+    for (const [name, hex] of Object.entries(COLORS)) {
+      const marker = document.createElementNS(SVG_NS, 'marker');
+      marker.setAttribute('id', 'head-' + name);
+      marker.setAttribute('viewBox', '0 0 10 10');
+      marker.setAttribute('refX', '6');
+      marker.setAttribute('refY', '5');
+      marker.setAttribute('markerWidth', '4');
+      marker.setAttribute('markerHeight', '4');
+      marker.setAttribute('orient', 'auto');
+      const tip = document.createElementNS(SVG_NS, 'path');
+      tip.setAttribute('d', 'M0,0 L10,5 L0,10 z');
+      tip.setAttribute('fill', hex);
+      marker.appendChild(tip);
+      defs.appendChild(marker);
+    }
+    svg.appendChild(defs);
+
+    arrows.forEach((line, i) => {
+      const fromIdx = squareIndex(line.move.slice(0, 2));
+      const toIdx = squareIndex(line.move.slice(2, 4));
+      const a = { x: (displayPos(fromIdx) % 8) + 0.5, y: Math.floor(displayPos(fromIdx) / 8) + 0.5 };
+      const b = { x: (displayPos(toIdx) % 8) + 0.5, y: Math.floor(displayPos(toIdx) / 8) + 0.5 };
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const shrink = 0.3 / len; // pull the line back so the head sits inside the target square
+
+      const best = i === 0;
+      const line2 = document.createElementNS(SVG_NS, 'line');
+      line2.setAttribute('x1', a.x);
+      line2.setAttribute('y1', a.y);
+      line2.setAttribute('x2', b.x - dx * shrink);
+      line2.setAttribute('y2', b.y - dy * shrink);
+      line2.setAttribute('stroke', best ? COLORS.best : COLORS.alt);
+      line2.setAttribute('stroke-width', best ? '0.2' : '0.12');
+      line2.setAttribute('stroke-linecap', 'round');
+      line2.setAttribute('opacity', best ? '0.9' : '0.6');
+      line2.setAttribute('marker-end', 'url(#head-' + (best ? 'best' : 'alt') + ')');
+      svg.appendChild(line2);
+    });
+
+    boardEl.appendChild(svg);
+  }
+
+  // Score from the side to move -> score from white's side, as text.
+  function describe(line, side) {
+    const whiteSign = side === 'w' ? 1 : -1;
+    if (line.mate !== null) {
+      const m = line.mate * whiteSign;
+      return m > 0 ? 'Putih mate dalam ' + m : 'Hitam mate dalam ' + Math.abs(m);
+    }
+    const v = (line.cp * whiteSign) / 100;
+    return (v > 0 ? '+' : '') + v.toFixed(2) + ' (putih)';
+  }
+
+  let currentSide = 'w';
+
+  function onLine(line) {
+    if (line === 'uciok') {
+      engine.postMessage('setoption name MultiPV value ' + LINES);
+      engine.postMessage('isready');
+      return;
+    }
+    if (line === 'readyok') {
+      if (!engineReady) {
+        engineReady = true;
+        analyseBtn.disabled = false;
+        setStatus('Siap. Isi FEN lalu tekan Analisa.');
+      }
+      return;
+    }
+    if (!pending) return;
+    if (line.startsWith('info') && line.includes(' pv ')) {
+      const idx = /multipv (\d+)/.exec(line);
+      const pv = / pv (\S+)/.exec(line);
+      const cp = / score cp (-?\d+)/.exec(line);
+      const mate = / score mate (-?\d+)/.exec(line);
+      if (idx && pv) {
+        pending[Number(idx[1]) - 1] = {
+          move: pv[1],
+          cp: cp ? Number(cp[1]) : 0,
+          mate: mate ? Number(mate[1]) : null,
+        };
+      }
+      return;
+    }
+    if (line.startsWith('bestmove')) finish();
+  }
+
+  function analyse() {
+    if (busy || !engineReady) return;
+    let parsed;
+    try {
+      parsed = parseFen(fenEl.value);
+    } catch (err) {
+      setStatus(err.message);
+      return;
+    }
+
+    board = parsed.board;
+    currentSide = parsed.side;
+    arrows = [];
+    evalEl.textContent = '';
+    render();
+
+    busy = true;
+    analyseBtn.disabled = true;
+    pending = [];
+    analysedFen = parsed.fen;
+    setStatus('Mikir...');
+    engine.postMessage('position fen ' + parsed.fen);
+    engine.postMessage('go depth ' + DEPTH);
+
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => {
+      // Kill the stuck worker and boot a fresh one, so a late bestmove can never mix in.
+      engine.terminate();
+      busy = false;
+      finish();
+      startEngine();
+      setStatus('Mesin kelamaan, dimulai ulang. Tunggu sebentar.');
+    }, WATCHDOG_MS);
+  }
+
+  function finish() {
+    clearTimeout(watchdog);
+    // If the FEN was edited while the engine was thinking, these arrows belong to the old position.
+    let stale = true;
+    try { stale = parseFen(fenEl.value).fen !== analysedFen; } catch (err) { stale = true; }
+    arrows = stale ? [] : (pending || []).filter(Boolean);
+    pending = null;
+    busy = false;
+    analyseBtn.disabled = false;
+
+    if (stale) {
+      evalEl.textContent = '';
+      setStatus('FEN sudah diubah. Tekan Analisa lagi.');
+    } else if (arrows.length === 0) {
+      setStatus('Tidak ada hasil dari mesin.');
+    } else {
+      evalEl.textContent = describe(arrows[0], currentSide);
+      setStatus('Terbaik: ' + arrows[0].move + (arrows[1] ? ' · alternatif: ' + arrows[1].move : ''));
+    }
+    render();
+  }
+
+  // Live preview: draw the board as soon as the FEN parses.
+  fenEl.addEventListener('input', () => {
+    try {
+      board = parseFen(fenEl.value).board;
+      arrows = [];
+      evalEl.textContent = '';
+      render();
+      if (engineReady) setStatus('FEN valid. Tekan Analisa.');
+    } catch (err) {
+      setStatus(err.message);
+    }
+  });
+
+  document.getElementById('form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    analyse();
+  });
+
+  document.getElementById('flip').addEventListener('click', () => {
+    flip = !flip;
+    render();
+  });
+
+  document.getElementById('start').addEventListener('click', () => {
+    fenEl.value = START_FEN;
+    fenEl.dispatchEvent(new Event('input'));
+  });
+
+  fenEl.value = START_FEN;
+  board = parseFen(START_FEN).board;
+  render();
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+</script>
+</body>
+</html>
